@@ -251,6 +251,28 @@
                                                           form))]
     (t/is (:preserved? (meta instrumented)))))
 
+(t/deftest test-coll-strips-reader-metadata-from-runtime-values
+  (t/testing "Reader metadata (:line, :column, etc.) should not leak into runtime collection values"
+    ;; Simulate what tools.reader produces: a vector with :line/:column metadata.
+    ;; Under instrumentation this metadata must be stripped so that runtime values
+    ;; don't carry source-location metadata, which would break metadata-aware
+    ;; serializers like Nippy when collections are used as keys.
+    (let [form (with-meta [:demo "1"] {:line 10 :column 5 :end-line 10 :end-column 20})
+          result (eval (inst/wrap #'inst/nop 0 form))]
+      (t/is (= [:demo "1"] result))
+      (t/is (nil? (meta result))
+            "Runtime vector should not carry reader metadata"))
+    ;; User-defined metadata (non-reader keys) should still be preserved
+    (let [form (with-meta [:demo "1"] {:line 10 :column 5 :custom true})
+          result (eval (inst/wrap #'inst/nop 0 form))]
+      (t/is (= [:demo "1"] result))
+      (t/is (true? (:custom (meta result)))
+            "Custom metadata should be preserved")
+      (t/is (nil? (:line (meta result)))
+            "Reader :line metadata should be stripped")
+      (t/is (nil? (:column (meta result)))
+            "Reader :column metadata should be stripped"))))
+
 (def test-coll-is-evaluated-once-count
   "This needs to be reachable from global scope."
   (atom 0))

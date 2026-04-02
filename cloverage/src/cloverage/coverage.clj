@@ -72,11 +72,18 @@
   "Eval the given form and record that the given line on the given
   files was run."
   [idx form]
-  (with-meta
-    `(do
-       (cover ~idx)
-       ~form)
-    (meta form)))
+  ;; Strip reader/source metadata from the do wrapper. The Clojure compiler
+  ;; preserves metadata on forms, which can leak reader metadata (:line,
+  ;; :column, etc.) onto runtime values — corrupting metadata-aware serializers
+  ;; like Nippy. Coverage line tracking is already recorded separately via
+  ;; parse-form, so stripping here is safe.
+  (let [clean-meta (when-let [m (meta form)]
+                     (not-empty (dissoc m :line :column :end-line :end-column
+                                         :file :source)))]
+    (cond-> `(do
+               (cover ~idx)
+               ~form)
+      clean-meta (with-meta clean-meta))))
 
 (defn parse-form
   [form line-hint]

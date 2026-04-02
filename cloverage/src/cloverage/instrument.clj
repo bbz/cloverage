@@ -12,6 +12,42 @@
    (instance? clojure.lang.IObj form)
    (not (instance? clojure.lang.AFunction form))))
 
+(def ^:private reader-meta-keys
+  "Metadata keys originating from tools.reader source tracking.
+  These must be stripped from instrumented forms to prevent leaking into
+  runtime values, where they corrupt metadata-aware serializers (e.g. Nippy)."
+  [:line :column :end-line :end-column :file :source])
+
+(defn- strip-reader-meta
+  "Remove reader/source-tracking metadata keys from form, preserving
+  semantically meaningful metadata such as :tag type hints."
+  [form]
+  (if (iobj? form)
+    (let [m (meta form)]
+      (if m
+        (let [clean (apply dissoc m reader-meta-keys)]
+          (if (seq clean)
+            (with-meta form clean)
+            (with-meta form nil)))
+        form))
+    form))
+
+(defn- strip-reader-meta-deep
+  "Recursively strip reader metadata from form and all sub-forms.
+  Needed for quoted forms: tools.reader attaches :line/:column metadata
+  to symbols and collections inside (quote ...), and since quote returns
+  its argument as-is, this metadata leaks into runtime values."
+  [form]
+  (cond
+    (not (iobj? form))     form
+    (seq? form)            (strip-reader-meta (with-meta (doall (map strip-reader-meta-deep form)) (meta form)))
+    (vector? form)         (strip-reader-meta (with-meta (mapv strip-reader-meta-deep form) (meta form)))
+    (set? form)            (strip-reader-meta (with-meta (set (map strip-reader-meta-deep form)) (meta form)))
+    (map? form)            (strip-reader-meta (with-meta (zipmap (map strip-reader-meta-deep (keys form))
+                                                                 (map strip-reader-meta-deep (vals form)))
+                                                         (meta form)))
+    :else                  (strip-reader-meta form)))
+
 (defn- propagate-line-numbers
   "Assign :line metadata to all possible elements in a form,
   using start as default."
@@ -35,7 +71,8 @@
   (if (iobj? new)
     (-> (propagate-line-numbers (:line (meta old)) new)
         (vary-meta merge (meta old))
-        (vary-meta assoc :original old))
+        (vary-meta assoc :original old)
+        strip-reader-meta)
     new))
 
 (defn- atomic-special? [sym]
@@ -294,9 +331,15 @@
   (let [form (vary-meta form dissoc ::rw/transformed)]
     (wrap f line (rw/macroexpand form))))
 
-;; Don't descend into atomic forms, but do wrap them
+;; Don't descend into atomic forms, but do wrap them.
+;; For quoted forms, strip reader metadata from the quoted value since
+;; (quote x) returns x as-is — any tools.reader metadata on x leaks
+;; into runtime values.
 (defmethod do-wrap :atomic [f line form _]
-  (f line form))
+  (f line (if (and (seq? form) (= 'quote (first form)))
+            (let [cleaned (strip-reader-meta-deep (second form))]
+              (with-meta (list 'quote cleaned) (meta form)))
+            form)))
 
 ;; Only here for Clojure 1.4 compatibility, 1.6 has record?
 (defn- map-record? [x]
@@ -318,9 +361,10 @@
                       :else (do
                               (when (nil? (empty form))
                                 (throw+ (str "Can't construct empty " (class form))))
-                              `(into ~(empty form) [] ~(vec wrappee))))]
+                              `(into ~(empty form) [] ~(vec wrappee))))
+]
     (d/tprn ":wrapped" (class form) (class wrapped) wrapped)
-    (f line (vary-meta wrapped merge (meta form)))))
+    (f line (strip-reader-meta wrapped))))
 
 (defn wrap-fn-body [f line form]
   (let [fn-sym (first form)
@@ -330,7 +374,9 @@
                            ~@(wrap-overloads f line (rest (rest form))))
                  `(~fn-sym ~@(wrap-overloads f line (rest form))))]
     (d/tprnl "Instrumented function" res)
-    (vary-meta res (partial merge (meta form)))))
+    (-> res
+        (vary-meta (partial merge (meta form)))
+        strip-reader-meta)))
 
 ;; Wrap a fn form
 (defmethod do-wrap :fn [f line form _]
